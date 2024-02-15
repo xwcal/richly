@@ -1,0 +1,53 @@
+* Intro
+*richly* converts markdown or emacs org-mode files into html and renders latex as inline svg. You can scroll down to see the demo below or visit [[https://xwcal.github.io/posts/2024/01/21/on-exponentiation/][this page]] to see its product.
+
+The initial iteration I wrote overnight a few years ago also included PlantUML integration (thus the name "richly"). The diagramming feature can be added back if popular demand exists.
+
+* Dependencies
+In order to use richly, you need:
+- a working latex setup that generates dvi output
+- pandoc
+- dvisvgm
+- linux
+
+* Basic usage
+The =<input file>= below should be either a =.md= or a =.org= file.
+
+For a one shot conversion:
+#+begin_src 
+$ richly <input file> <output file>
+#+end_src
+
+To let richly monitor =<input file>= and do incremental conversion as you edit it, add the -s switch:
+#+begin_src 
+$ richly -s <input file> <output file>
+#+end_src
+
+In either case, you may find the =-v= switch helpful.
+
+* Hugo integration
+If you use org-mode, the input org files can coexist with markdown files under =content/=: simply add ="\\.org$"= to =ignoreFiles= in your site configuration file.
+
+Say you are writing a post named =some-post.org=, you need to enclose the front matter between =#+begin_src= and =#+end_src=, then run =richly= with the =-r= swtich:
+#+begin_src 
+$ richly -s -r -v some-post.org some-post.md
+#+end_src
+
+With =hugo server= running you can see the result update in real time as you edit =some-post.org=.
+
+If you use markdown, you need to keep a seperate "richly source files" directory outside your hugo site directory so that hugo doesn't get confused. And you need to enclose the front matter in a code block using a pair of =```= (or more backticks if necessary) instead.
+
+* Demo
+This README.md is generated using richly :)
+
+Schrödinger equation:
+
+$$ i \hbar \frac{d}{dt}\vert\Psi(t)\rangle = \hat H \vert \Psi(t)\rangle $$
+
+where $i$ is $\sqrt{-1}$, $\hbar$ is the Planck constant divided by $2\pi$, $t$ is time, $\vert\Psi(t)\rangle$ is the state vector, and $\hat H$ is the Hamiltonian.
+
+Something else:
+$$ \forall x (x \neq \varnothing \Rightarrow \exists y (y \in x \land y \cap x = \varnothing)) $$
+
+* TODOs
+Add an option for saving and restoring the cache to avoid potentially lengthy cold starts.

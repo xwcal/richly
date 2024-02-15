@@ -1,0 +1,691 @@
+#!/usr/bin/python3
+
+########################################################################
+# richly                                                               #
+#                                                                      #
+# Copyright (C) 2020, 2024 Xiao Wan                                    #
+#                                                                      #
+# richly is free software; you can redistribute it and/or modify       #
+# it under the terms of the GNU General Public License as published by #
+# the Free Software Foundation; either version 3 of the License, or    #
+# (at your option) any later version.                                  #
+#                                                                      #
+# richly is distributed in the hope that it will be useful,            #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of       #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the        #
+# GNU General Public License for more details.                         #
+#                                                                      #
+# You should have received a copy of the GNU General Public License    #
+# along with richly.  If not, see <http://www.gnu.org/licenses/>.      #
+########################################################################
+
+# To use front matter with org input, enclose it with:
+# #+begin_src
+# #+end_src
+#
+# To use front matter with markdown input, enclose it with:
+# ```
+# ```
+# (or use more backticks if necessary)
+# 
+# The pandoc step then encloses it between:
+# <pre><code>
+# </code></pre>
+# When richly is called with -r it treats first such block as front matter
+# and writes out the content verbatim.
+
+DEBUG=False
+
+TMPDIR = '/dev/shm/.richly/'
+CACHEDIR = TMPDIR + 'cache/'
+TEXFILE = TMPDIR + 'tmp.tex'
+DVIFILE = TMPDIR + 'tmp.dvi'
+
+# The font size of documentclass in the tex file influents the height of
+# the output of dvisvgm but not proportionally (the two aren't even
+# positively correlated). However, svg files of different glyphs generated
+# with same documentclass font size are proportional.
+# Also need some padding since the bottom of letters get truncated without.
+# 
+# Can experiment with:
+# $ latex -halt-on-error -interaction=nonstopmode tmp.tex >/dev/null
+# $ dvisvgm --cache=cache/ --no-fonts -s tmp.dvi
+
+SCALE = 1.35 # for \documentclass[12pt]
+PAD = str(1)
+
+import argparse
+import os
+import filecmp
+import datetime
+
+abspath = os.path.abspath
+isfile = os.path.isfile
+exists = os.path.exists
+samefile = filecmp.cmp
+now = datetime.datetime.now
+
+from math import inf
+from sys import stdout, stderr
+from signal import SIGIO, SIGINT, sigwait, SIG_BLOCK, pthread_sigmask
+from fcntl import \
+    fcntl, F_NOTIFY, DN_MODIFY, DN_ATTRIB, DN_CREATE, DN_RENAME, DN_MULTISHOT
+from subprocess import run as run_proc, PIPE, CalledProcessError
+from html.parser import HTMLParser
+
+# for pandoc
+fmts = {'md': 'markdown', 'org': 'org'}
+
+def bail(*args):
+    print('ERROR[%s]:'%nowstr(), *args, file=stderr)
+    exit(1)
+
+def warn(*args):
+    print('WARNING[%s]:'%nowstr(), *args, file=stderr)
+
+def info(*args):
+    print('INFO[%s]:'%nowstr(), *args, file=stderr)
+
+def dbgprint(*args):
+    print('DEBUG[%s]:'%nowstr(), *args, file=stderr)
+
+def nowstr():
+    return now().strftime('%H:%M:%S.%f')
+
+def pp_subproc_err(args, e):
+    return ('%s returned %d\nstdout:%s\nstderr:\n%s' %
+            (args,
+             e.returncode,
+             e.stdout.decode('utf-8') if e.stdout else '\n',
+             e.stderr.decode('utf-8') if e.stderr else '\n'))
+
+# It's impossible to avoid race entirely since the file system is shared
+# with other programs, which aren't necessarily cooperative. And this is
+# complicated by, take Emacs for example, renaming of files and creation
+# of temporary files.
+#
+# The trick is to monitor all additive changes but act on only definitive
+# changes (by checking the stat), assuming we have read after write
+# consistency for at least one of the DN_* writes and the subsequent
+# stat read, and that the subsequent file content we read is as fresh as
+# the meta from stat
+class Monitor:
+    def run(self, fn, callback):
+        if DEBUG:
+            self._runcount = 0
+        eps = 0.001
+        sz, mts = self._get_stat(fn)
+        if DEBUG:
+            dbgprint('sz: %s, mts: %s'%(sz, mts))
+        dn = os.path.split(fn)[0]
+        try:
+            dd = os.open(dn, os.O_RDONLY)
+        except IOError as e:
+            bail('failed to monitor "%s" with error:\n%s'%(dn, e))
+        try:
+            sigset = {SIGIO, SIGINT}
+            pthread_sigmask(SIG_BLOCK, sigset)
+            fcntl(dd, F_NOTIFY,
+                  DN_MODIFY|DN_RENAME|DN_CREATE|DN_ATTRIB|DN_MULTISHOT)
+            print('Press ctrl+c to exit', file=stderr)
+            while True:
+                sig = sigwait(sigset)
+                if sig == SIGIO:
+                    sz, ts = self._get_stat(fn)
+                    if DEBUG:
+                        dbgprint('sz: %s, mts: %s, ts: %s'%(sz, mts, ts))
+                    if ts - mts > eps and sz > 0:
+                        callback()
+                        mts = ts
+                        if DEBUG:
+                            self._runcount += 1
+                            dbgprint('run count: %d'%self._runcount)
+                elif sig == SIGINT:
+                    self._onbreak()
+                else:
+                    print('Unknown signal: %s'%sig, file=stderr)
+        finally:
+            os.close(dd)
+
+    def _onbreak(self):
+        print('Got SIGINT ...', file=stderr)
+        exit(0)
+
+    def _get_stat(self, fn):
+        try:
+            stat = os.stat(fn)
+        except IOError:
+            return (0,0)
+        return (stat.st_size, stat.st_mtime)
+
+# see "tag soup" example at the end of 3.12.1 docs for html.parser
+# note that getpos returns 1-based row and 0-based col just as in emacs
+# wish there was simply a getoffset ...
+class MathExtractor(HTMLParser):
+    def __init__(self, callback, haslg):
+        super().__init__()
+        self.__callback = callback
+        self.__haslg = haslg
+        self.__lgetpos = None
+        self.__lgtext = ''
+        self.__dataready = False
+
+    def handle_startendtag(self, tag, attrs):
+        if tag != 'img':
+            return
+        dc = 0
+        title = ''
+        for k,v in attrs:
+            if k == 'src' and v.startswith('https://latex.codecogs.com'):
+                src = v
+                dc += 1
+            elif k == 'title':
+                formula = v
+                dc += 1
+            if dc == 2:
+                startpos = self.getpos()
+                endpos = self.getendpos(startpos, self.get_starttag_text())
+                if 'textstyle' in src:
+                    env = '$'
+                elif formula.startswith('\\begin'):
+                    env = ''
+                else:
+                    env = '$$'
+                self.__callback(startpos, endpos, formula, env)
+                return
+        if dc > 0 and not title:
+            warn('webtex img without title:', self.get_starttag_text())
+
+    @staticmethod
+    def getendpos(startpos, text):
+        r, c = startpos
+        lns = text.splitlines()
+        if len(lns) == 1:
+            return r, c + len(lns[0])
+        else:
+            return r + len(lns) - 1, len(lns[-1])
+
+    def handle_starttag(self, tag, _):
+        if self.__haslg and tag == 'code':
+            self.__haslg = False
+            self.__dataready = True
+
+    def handle_data(self, data):
+        if self.__dataready:
+            self.__lgtext = data
+
+    def handle_endtag(self, tag):
+        if self.__dataready:
+            self.__dataready = False
+            self.__lgetpos = self.getpos()
+
+    def leading_garbage(self):
+        return self.__lgetpos, self.__lgtext
+
+class SVGParser(HTMLParser):
+    def __init__(self, callback, fontsize, lineheight, env):
+        super().__init__()
+        self.__callback = callback
+        self.__lineheight = lineheight
+        self.__inline = env == '$'
+        self.__pid2rlsid = {}
+        self.__uses = []
+        self.__rects = []
+        self.__firstrect = self.__inline
+        self.__minx = inf
+        self.__attrs = []
+        self.__vbx = 0.0
+        self.__vby = 0.0
+        self.__vbw = 0.0
+        self.__vbh = 0.0
+        self.__baseline = 0.0
+        self.__scale = SCALE * fontsize / 12
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'svg':
+            if DEBUG:
+                dbgprint(attrs)
+            xywh = None
+            for k, v in attrs:
+                # need all lower case "viewbox"
+                # see stackoverflow 25033268
+                if k == 'viewbox':
+                    try:
+                        xywh = v.split(' ')
+                        self.__vbx = float(xywh[0])
+                        self.__vby = float(xywh[1])
+                        self.__vbw = float(xywh[2])
+                        self.__vbh = float(xywh[3])
+                    except (IndexError, ValueError):
+                        raise SVGParserError('svg', self.get_starttag_text())
+                elif k == 'style' or k == 'width' or k == 'height':
+                    pass # discard
+                else:
+                    self.__attrs.append((k, v))
+            if not xywh:
+                raise SVGParserError('svg', self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == 'path':
+            dc = 0
+            for k, v in attrs:
+                if k == 'id':
+                    pid = v
+                    dc += 1
+                elif k == 'd':
+                    pathd = v
+                    dc += 1
+                if dc == 2:
+                    rlsid = self.__callback(pathd)
+                    self.__pid2rlsid[pid] = rlsid
+                    return
+            raise SVGParserError('path', self.get_starttag_text())
+        elif tag == 'use':
+            dc = 0
+            for k, v in attrs:
+                if k == 'x':
+                    x = v
+                    dc += 1
+                elif k == 'y':
+                    y = v
+                    dc += 1
+                elif k == 'xlink:href':
+                    href = v
+                    dc += 1
+                if dc == 3:
+                    if self.__inline:
+                        if not self.__adjustxw(x):
+                            break
+                    pid = href[1:]
+                    self.__uses.append((x, y, self.__pid2rlsid[pid]))
+                    return
+            raise SVGParserError('use', self.get_starttag_text())
+        elif tag == 'rect':
+            if self.__firstrect:
+                self.__firstrect = False
+                dc = 0
+                for k, v in attrs:
+                    if k == 'y' or k == 'height':
+                        try:
+                            self.__baseline += float(v)
+                        except ValueError:
+                            break
+                        else:
+                            dc += 1
+                            if dc == 2:
+                                return
+                raise SVGParserError('rect', self.get_starttag_text())
+            elif self.__inline:
+                for k, v in attrs:
+                    if k == 'x':
+                        if not self.__adjustxw(v):
+                            break
+                        self.__rects.append(self.get_starttag_text())
+                        return
+                raise SVGParserError('rect', self.get_starttag_text())
+            else:
+                self.__rects.append(self.get_starttag_text())
+                return
+
+    def __adjustxw(self, x):
+        try:
+            vbx = float(x)
+        except ValueError:
+            return False
+        if vbx >= self.__minx:
+            return True
+        self.__minx = vbx
+        self.__vbw -= vbx - self.__vbx
+        self.__vbx = vbx
+        return True
+
+    def usedump(self):
+        return '\n'.join(map(lambda t: '<use x="%s" y="%s" href="#%s"/>'%t,
+                             self.__uses))
+
+    def rectdump(self):
+        return '\n'.join(self.__rects)
+
+    def attrdump(self):
+        astr = ' '.join(map(lambda t: '%s="%s"'%t, self.__attrs))
+        width = self.__vbw * self.__scale
+        height = self.__vbh * self.__scale
+        rest = 'width="%.2fpt" height="%.2fpt" ' % (width, height)
+        rest += 'viewbox="%.2f %.2f %.2f %.2f" ' % (self.__vbx, self.__vby,
+                                                    self.__vbw, self.__vbh)
+        if self.__inline:
+            rest += self.__inline_style()
+        if DEBUG:
+            dbgprint(rest)
+        if astr:
+            return astr + ' ' + rest
+        else:  
+            return rest
+
+    def __inline_style(self):
+        if DEBUG:
+            dbgprint(f'vby: {self.__vby}, vbh: {self.__vbh}, '+
+                     f'baseline: {self.__baseline}, '+
+                     f'lineheight: {self.__lineheight}, '+
+                     f'scale: {self.__scale}')
+        p = (self.__vby + self.__vbh - self.__baseline)\
+            * self.__scale / self.__lineheight
+        return 'style="vertical-align:-%.2f%%"'%(p*100)
+
+    def get_rlsids(self):
+        return self.__pid2rlsid.values()
+
+class SVGParserError(Exception):
+    pass
+
+class MathRenderer:
+    def __init__(self, fontsize, lineheight, packages, haslg, verbose):
+        self._cache = {}
+        self._pathd2id = {}
+        self._id2pathd = {}
+        self._idn = 0
+        self._err_place_holder = \
+            '<span style="color:red;border-style:solid;">LATEX ERROR</span>'
+        self._args = None
+        self._data = None
+        self._all_rlsids = None
+        self._no_rlsids = {}.values() # just being type pedantic
+        self._fontsize = fontsize
+        self._lineheight = lineheight
+        self._usepackages = ''.join((map(lambda p: '\\usepackage{%s}'%p,
+                                         packages.split(':'))))
+        self._haslg = haslg
+        self._lg = None
+        self._verbose = verbose
+        self._prep_dirs_devnull()
+
+    def _prep_dirs_devnull(self):
+        try:
+            os.makedirs(CACHEDIR, exist_ok=True)
+            self._devnull = open(os.devnull, 'w')
+        except IOError as e:
+            bail(e)
+
+    def subgen(self):
+        for t in self._data:
+            yield t
+
+    def feed(self, pdhtml):
+        self._data = []
+        self._all_rlsids = set()
+        # a little peeking now saves a lot of checking later:
+        haslg = self._haslg and pdhtml.startswith('<pre><code>')
+        me = MathExtractor(self._me_callback, haslg)
+        me.feed(pdhtml)
+        self._lg = me.leading_garbage()
+
+    def _me_callback(self, startpos, endpos, formula, env):
+        if self._verbose:
+            info(f'formula: {formula}, env: {env}')
+        try:
+            rlsids, svg = self._cache[(formula, env)]
+        except KeyError:
+            try:
+                rawsvg = self._render_svg(formula, env)
+                if DEBUG:
+                    try:
+                        with open(CACHEDIR + 'raw.svg', 'w') as f:
+                            f.write(rawsvg)
+                    except IOError:
+                        pass
+            except CalledProcessError as e:
+                warn(pp_subproc_err(self._args, e))
+                svg = self._err_place_holder
+                rlsids = self._no_rlsids
+            else:
+                rlsids, svg = self._restruct_svg(rawsvg, formula, env)
+                if rlsids:
+                    self._cache[(formula, env)] = (rlsids, svg)
+        self._data.append((startpos, endpos, svg))
+        self._all_rlsids.update(rlsids)
+
+    def _render_svg(self, formula, env):
+        if not self._write_texfile(formula, env):
+            return self._err_place_holder
+        self._args = ['latex', '-halt-on-error', '-interaction=nonstopmode',
+                      '-output-directory='+TMPDIR, TEXFILE]
+        run_proc(self._args, stdout=self._devnull, stderr=PIPE, check=True)
+        self._args = ['dvisvgm', '--cache='+CACHEDIR, '--no-fonts', '-s',
+                      '-b', PAD, DVIFILE]
+        done_proc = run_proc(self._args, stdout=PIPE, stderr=PIPE, check=True)
+        return done_proc.stdout.decode('utf-8')
+
+    def _write_texfile(self, formula, env):
+        if env == '$':
+            blref = '{\_}'
+        else:
+            blref = ''
+        try:
+            f = open(TEXFILE, 'w')
+            f.write('\\documentclass[12pt]{article}' +
+                    self._usepackages +
+                    '\\pagestyle{empty}\\special{bgcolor Transparent}' +
+                    '\\begin{document}' +
+                    '%s%s%s%s'%(env, blref, formula, env) +
+                    '\\end{document}')
+            return True
+        except IOError as e:
+            warn(e)
+            return False
+        finally:
+            f.close()
+
+    def _restruct_svg(self, rawsvg, formula, env):
+        if env == '$':
+            wrapper = '%s'
+        else:
+            # horizontal centering: stackoverflow 114543
+            # need css trick to remove extra spacing of <br/>s from pandoc :
+            # p > br { display: none; }
+            wrapper = \
+                '<span style="justify-content:center;display:flex;">%s</span>'
+        sp = SVGParser(self._sp_callback, self._fontsize, self._lineheight,
+                       env)
+        try:
+            sp.feed(rawsvg)
+            return (sp.get_rlsids(),
+                    wrapper % ('<svg class="richly-math" %s>'%sp.attrdump() +
+                               '<title>%s</title>'%formula +
+                               '<g>%s\n%s</g></svg>'%(sp.usedump(),
+                                                      sp.rectdump())))
+        except SVGParserError as e:
+            warn(f'bad {e.args[0]} for "{formula}" with env "{env}":',
+                 e.args[1])
+            return self._no_rlsids, self._err_place_holder
+        
+    def _sp_callback(self, pathd):
+        try:
+            return self._pathd2id[pathd]
+        except KeyError:
+            # rlsid -- richly-latex-svg id
+            rlsid = 'rlsid-' + str(self._idn)
+            self._idn += 1
+            self._pathd2id[pathd] = rlsid
+            self._id2pathd[rlsid] = pathd
+            return rlsid
+
+    def leading_garbage(self):
+        return self._lg
+
+    def defonly_svg(self):
+        return '\n\n\n<svg style="display: none;"><defs>%s</defs></svg>' %\
+            '\n'.join(map(lambda x:\
+                          '<path id="%s" d="%s"></path>' %\
+                          (x, self._id2pathd[x]),
+                          self._all_rlsids))
+
+class Processor:
+    def __init__(self, stay, ext, haslg, fontsize, lineheight, packages,
+                 verbose, ifn, ofn):
+        self._stay = stay
+        if ext:
+            self._ext = ext
+        else:
+            self._ext = os.path.splitext(ifn)[1][1:]
+        if self._ext not in fmts:
+            bail('unrecognized extension: %s'%self._ext)
+        self._mr = MathRenderer(fontsize, lineheight, packages, haslg,
+                                verbose)
+        self._ifmt = fmts[self._ext]
+        self._ofmt = fmts['md']
+        self._ifn = abspath(ifn)
+        if not isfile(self._ifn):
+            bail('not a file: "%s"'%self._ifn)
+        if ofn:
+            self._ofn = abspath(ofn)
+            self._check_ofn()
+        elif stay:
+            bail('outfile is required with -s')
+        else:
+            self._ofn = ''
+
+    def run(self):
+        self._onchange()
+        if self._stay:
+            Monitor().run(self._ifn, self._onchange)
+
+    # limited sanity check (no guarentee no race/destruction)
+    def _check_ofn(self):
+        try:
+            if samefile(self._ifn, self._ofn):
+                bail('input file and output file cannot be the same.')
+        except FileNotFoundError:
+            pass
+        if isfile(self._ofn):
+            print('outfile already exist and will be overwritten:',
+                  file=stderr)
+            print(self._ofn, file=stderr)
+            print('Enter Y/y to continue, or anything else to abort: > ',
+                  end='', file=stderr)
+            r = 'N'
+            try:
+                r = input()
+            except EOFError:
+                pass
+            if r != 'Y' and r != 'y':
+                exit(0)
+        elif exists(self._ofn):
+            bail('"%s" already exists.'%self._ofn)    
+            
+    def _onchange(self):
+        if DEBUG:
+            dbgprint('onchange enter')
+        self._do_processing()
+        if DEBUG:
+            dbgprint('onchange exit')
+
+    def _do_processing(self):
+        args = ['pandoc', '-f', self._ifmt, '-t', 'html', '--webtex',
+                self._ifn]
+        try:
+            done_proc = run_proc(args, stdout=PIPE, stderr=PIPE, check=True)
+        except CalledProcessError as e:
+            if self._stay:
+                warn(pp_subproc_err(args, e))
+                return
+            else:
+                bail(pp_subproc_err(args, e))
+        pdhtml = done_proc.stdout.decode('utf-8')
+        self._mr.feed(pdhtml)
+        if self._ofn:
+            try:
+                ofh = open(self._ofn, 'w')
+            except IOError as e:
+                bail('Failed to open "%s": %e'%(self._ofn, e))
+        else:
+            ofh = stdout
+        lgetpos, lgtext = self._mr.leading_garbage()
+        try:
+            ofh.write(lgtext)
+            self._substitute_write(ofh, self._mr.subgen(), pdhtml, lgetpos)
+            ofh.write(self._mr.defonly_svg())
+        finally:
+            if ofh is not stdout:
+                ofh.close()
+
+    # complicated logic required for r,c
+    def _substitute_write(self, ofh, subit, pdhtml, lgetpos):
+        lns = pdhtml.splitlines()
+        if lgetpos:
+            rcur, ccur = lgetpos
+            # sanity check:
+            if lns[rcur-1][ccur:].startswith('</code></pre>'):
+                ccur += 13
+            else:
+                # or simply fail?
+                warn('unexpected front matter end tags: %s'%\
+                     lns[rcur-1][ccur:])
+                rcur += 1
+                ccur = 0
+        else:
+            rcur, ccur = 1, 0
+        for startpos, endpos, svg in subit:
+            rlim, clim = startpos
+            if rcur < rlim:
+                ofh.write(lns[rcur-1][ccur:])
+                ofh.write('\n')
+                rcur += 1
+                while rcur < rlim:
+                    ofh.write(lns[rcur-1])
+                    ofh.write('\n')
+                    rcur += 1
+                ofh.write(lns[rcur-1][:clim])
+            else:
+                ofh.write(lns[rcur-1][ccur:clim])
+            ofh.write(svg)
+            rcur, ccur = endpos
+        ofh.write(lns[rcur-1][ccur:])
+        ofh.write('\n')
+        rcur += 1
+        while rcur <= len(lns):
+            ofh.write(lns[rcur-1])
+            ofh.write('\n')
+            rcur += 1
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='richly') # ToDo
+    parser.add_argument('-s', dest='stay', action='store_true',
+                        help='make the process run in server mode, '+
+                        'so that it stays until ctrl+c is pressed')
+    parser.add_argument('-e', dest='ext', choices=fmts.keys(),
+                        help='if supplied, overrides input file extension')
+    parser.add_argument('-r', dest='haslg', action='store_true',
+                        help='input has front matter')
+    parser.add_argument('-f', dest='fontsize', type=int, default=12,
+                        help='font size in pt')
+    parser.add_argument('-l', dest='lineheight', type=int, default=18,
+                        help='line height in pt')
+    parser.add_argument('-p', dest='packages', type=str,
+                        default='amssymb:amsmath',
+                        help='colon seperated list of latex packages')
+    parser.add_argument('-v', dest='verbose', action='store_true',
+                        help='show the latex formula being processed')
+    parser.add_argument('infile', metavar='infile', type=str,
+                        help='the input file')
+    parser.add_argument('outfile', metavar='outfile', nargs='?', default='',
+                        help='the output file (required with -s)')
+    args = parser.parse_args()
+    if 'DEBUG' in os.environ:
+        DEBUG = True
+    if DEBUG:
+        dbgprint(('stay: %s, suffix: %s, '+
+                  'infile: %s, outfile: %s')%(args.stay,
+                                              args.ext,
+                                              args.infile,
+                                              args.outfile))
+    if args.stay and not args.outfile:
+        bail('outfile is required when -s is specified')
+    Processor(args.stay,
+              args.ext,
+              args.haslg,
+              args.fontsize,
+              args.lineheight,
+              args.packages,
+              args.verbose,
+              args.infile,
+              args.outfile).run()
