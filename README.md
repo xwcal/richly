@@ -2,8 +2,7 @@ Intro
 =====
 
 **richly** converts markdown or emacs org-mode files into html and
-renders latex as inline svg. You can scroll down to see the demo below
-or visit [this
+renders latex as inline svg. You can visit [this
 page](https://xwcal.github.io/posts/2024/01/21/on-exponentiation/) to
 see its product.
 
