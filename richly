@@ -375,8 +375,30 @@ class SVGParser(HTMLParser):
     def get_rlsids(self):
         return self.__pid2rlsid.values()
 
+    def get_eitop(self):
+        return (self.__vbh * self.__scale - self.__lineheight) / 2
+
 class SVGParserError(Exception):
     pass
+
+class SVG:
+    __slots__ = 'code', 'env', 'rlsids', 'eitop'
+
+    def __init__(self, sp, formula, env):
+        if sp:
+            self.code = ('<svg class="richly-math" %s>'%sp.attrdump() +
+                         '<title>%s</title>'%formula +
+                         '<g>%s\n%s</g></svg>'%(sp.usedump(),
+                                                sp.rectdump()))
+            self.env = env
+            self.rlsids = sp.get_rlsids()
+            self.eitop = sp.get_eitop()
+        else:
+            self.code = ('<span style="color:red;border-style:solid;">'+
+                         'LATEX ERROR: "%s"</span>'%formula)
+            self.env = env
+            self.rlsids = {}.values() # just being type pedantic
+            self.eitop = 0.0
 
 class MathRenderer:
     def __init__(self, fontsize, lineheight, packages, haslg, verbose):
@@ -384,18 +406,16 @@ class MathRenderer:
         self._pathd2id = {}
         self._id2pathd = {}
         self._idn = 0
-        self._err_place_holder = \
-            '<span style="color:red;border-style:solid;">LATEX ERROR</span>'
         self._args = None
         self._data = None
         self._all_rlsids = None
-        self._no_rlsids = {}.values() # just being type pedantic
         self._fontsize = fontsize
         self._lineheight = lineheight
         self._usepackages = ''.join((map(lambda p: '\\usepackage{%s}'%p,
                                          packages.split(':'))))
         self._haslg = haslg
         self._lg = None
+        self._eqnidx = None
         self._verbose = verbose
         self._prep_dirs_devnull()
 
@@ -411,6 +431,7 @@ class MathRenderer:
             yield t
 
     def feed(self, pdhtml):
+        self._eqnidx = 1
         self._data = []
         self._all_rlsids = set()
         # a little peeking now saves a lot of checking later:
@@ -423,7 +444,7 @@ class MathRenderer:
         if self._verbose:
             info(f'formula: {formula}, env: {env}')
         try:
-            rlsids, svg = self._cache[(formula, env)]
+            svg = self._cache[(formula, env)]
         except KeyError:
             try:
                 rawsvg = self._render_svg(formula, env)
@@ -435,14 +456,17 @@ class MathRenderer:
                         pass
             except CalledProcessError as e:
                 warn(pp_subproc_err(self._args, e))
-                svg = self._err_place_holder
-                rlsids = self._no_rlsids
+                svg = SVG(None, formula, env)
             else:
-                rlsids, svg = self._restruct_svg(rawsvg, formula, env)
-                if rlsids:
-                    self._cache[(formula, env)] = (rlsids, svg)
-        self._data.append((startpos, endpos, svg))
-        self._all_rlsids.update(rlsids)
+                svg = self._restruct_svg(rawsvg, formula, env)
+                if svg.rlsids:
+                    self._cache[(formula, env)] = svg
+        if env == '$':
+            self._data.append((startpos, endpos, svg, None))
+        else:
+            self._data.append((startpos, endpos, svg, self._eqnidx))
+            self._eqnidx += 1
+        self._all_rlsids.update(svg.rlsids)
 
     def _render_svg(self, formula, env):
         if not self._write_texfile(formula, env):
@@ -476,27 +500,15 @@ class MathRenderer:
             f.close()
 
     def _restruct_svg(self, rawsvg, formula, env):
-        if env == '$':
-            wrapper = '%s'
-        else:
-            # horizontal centering: stackoverflow 114543
-            # need css trick to remove extra spacing of <br/>s from pandoc :
-            # p > br { display: none; }
-            wrapper = \
-                '<span style="justify-content:center;display:flex;">%s</span>'
         sp = SVGParser(self._sp_callback, self._fontsize, self._lineheight,
                        env)
         try:
             sp.feed(rawsvg)
-            return (sp.get_rlsids(),
-                    wrapper % ('<svg class="richly-math" %s>'%sp.attrdump() +
-                               '<title>%s</title>'%formula +
-                               '<g>%s\n%s</g></svg>'%(sp.usedump(),
-                                                      sp.rectdump())))
+            return SVG(sp, formula, env)
         except SVGParserError as e:
             warn(f'bad {e.args[0]} for "{formula}" with env "{env}":',
                  e.args[1])
-            return self._no_rlsids, self._err_place_holder
+            return SVG(None, formula, env)
         
     def _sp_callback(self, pathd):
         try:
@@ -520,8 +532,8 @@ class MathRenderer:
                           self._all_rlsids))
 
 class Processor:
-    def __init__(self, stay, ext, haslg, fontsize, lineheight, packages,
-                 verbose, ifn, ofn):
+    def __init__(self, stay, ext, haslg, fontsize, lineheight, idxeqns,
+                 packages, verbose, ifn, ofn):
         self._stay = stay
         if ext:
             self._ext = ext
@@ -531,6 +543,7 @@ class Processor:
             bail('unrecognized extension: %s'%self._ext)
         self._mr = MathRenderer(fontsize, lineheight, packages, haslg,
                                 verbose)
+        self._idxeqns = idxeqns
         self._ifmt = fmts[self._ext]
         self._ofmt = fmts['md']
         self._ifn = abspath(ifn)
@@ -624,7 +637,7 @@ class Processor:
                 ccur = 0
         else:
             rcur, ccur = 1, 0
-        for startpos, endpos, svg in subit:
+        for startpos, endpos, svg, eqnidx in subit:
             rlim, clim = startpos
             if rcur < rlim:
                 ofh.write(lns[rcur-1][ccur:])
@@ -637,7 +650,7 @@ class Processor:
                 ofh.write(lns[rcur-1][:clim])
             else:
                 ofh.write(lns[rcur-1][ccur:clim])
-            ofh.write(svg)
+            ofh.write(self._wrap(svg, eqnidx))
             rcur, ccur = endpos
         ofh.write(lns[rcur-1][ccur:])
         ofh.write('\n')
@@ -646,6 +659,25 @@ class Processor:
             ofh.write(lns[rcur-1])
             ofh.write('\n')
             rcur += 1
+
+    # horizontal centering: stackoverflow 114543
+    # also need css trick to remove extra spacing of <br/>s from pandoc :
+    # p > br { display: none; }
+    def _wrap(self, svg, eqnidx):
+        if svg.env == '$':
+            return svg.code
+        elif self._idxeqns:
+            return ('<span style="justify-content:center;'+
+                    'display:flex;'+
+                    'position: relative;">'+
+                    svg.code+
+                    '<span style="position:absolute;right:0;'+
+                    'top:%.2fpt;">(%d)'%(svg.eitop, eqnidx)+
+                    '</span></span>')
+        else:
+            return ('<span style="justify-content:center;display:flex;">' +
+                    svg.code +
+                    '</span>')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='richly') # ToDo
@@ -660,6 +692,8 @@ if __name__ == '__main__':
                         help='font size in pt')
     parser.add_argument('-l', dest='lineheight', type=int, default=18,
                         help='line height in pt')
+    parser.add_argument('-i', dest='idxeqns', action='store_true',
+                        help='number latex display style formulas')
     parser.add_argument('-p', dest='packages', type=str,
                         default='amssymb:amsmath',
                         help='colon seperated list of latex packages')
@@ -685,6 +719,7 @@ if __name__ == '__main__':
               args.haslg,
               args.fontsize,
               args.lineheight,
+              args.idxeqns,
               args.packages,
               args.verbose,
               args.infile,
