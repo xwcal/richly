@@ -19,6 +19,10 @@
 # along with richly.  If not, see <http://www.gnu.org/licenses/>.      #
 ########################################################################
 
+
+############################################################
+# Front matter usage note
+# 
 # To use front matter with org input, enclose it with:
 # #+begin_src
 # #+end_src
@@ -34,6 +38,72 @@
 # When richly is called with -r it treats first such block as front matter
 # and writes out the content verbatim.
 
+############################################################
+# Cross reference usage note
+# 
+# To cross reference display style math in org:
+# label $$ ... $$ or \[ ... \] by placing a "dedicated target"
+# right above it, say, <<my-grand-equation>>, then reference it like
+# [[my-grand-equation][the humble equation]]
+# With numbering (-i), you can also do
+# [[my-grand-equation][equation $_]]
+# and $_ gets automatically replaced with the corresponding number.
+#
+# To cross reference display style math in markdown:
+# the label should be writen like []{#my-grand-equation} and referenced
+# like
+# [the humble equation](#my-grand-equation)
+# or, if richly is called with -i
+# [equation $_](#my-grand-equation)
+#
+# To cross reference headings in org:
+# label a section by setting the CUSTOM_ID property (C-c C-x p)
+# (other methods don't work reliably -- see github pandoc issue 6916)
+# say you have CUSTOM_ID = big-theorem, you can reference it like:
+# [[#big-theorem][my theorem]]
+# Similar to display style math, with numbering (-n), you can also do
+# [[#big-theorem][theorem $_]]
+# 
+# It may be useful to set the number of headline levels by adding
+# this line to the beginning of the input file:
+# #+OPTIONS: H:6
+# -- see stackoverflow 62707711 or https://pandoc.org/org.html
+#
+# To cross reference headings in markdown:
+# label a section like:
+# # My Theorem {#big-theorem}
+# and reference like:
+# [my theorem](#big-theorem)
+# or (with -n):
+# [theorem $_](#big-theorem)
+# 
+# To error on the safe side (depending on pandoc support),
+# use HTML4 style id as in stackoverflow 70579 for the label;
+# To have a literal $_ in the reference text, prefix it with another $
+# (note this is only necessary when referencing display style math)
+#
+# Caveat:
+# When using org input and cross referencing, be sure to enclose with
+# $$ $$ or with \[ \] display style math already enclosed with
+# \begin ... \end since otherwise pandoc would hide the label in the
+# preceding <p> ... </p> complicating the search. This however isn't
+# necessary for markdown input.
+#
+# References:
+# The Org Manual 4.1
+# Pandoc User's Guide 8.3 and 8.16.4.
+
+
+############################################################
+# CSS styling note
+#
+# The proper alignment of inline math depends on correct line height setting
+# which is specified using the -l option.
+# Be sure to style the html output so that all elements containing latex have
+# this exact "unitless number".
+
+
+
 DEBUG=False
 
 TMPDIR = '/dev/shm/.richly/'
@@ -41,17 +111,23 @@ CACHEDIR = TMPDIR + 'cache/'
 TEXFILE = TMPDIR + 'tmp.tex'
 DVIFILE = TMPDIR + 'tmp.dvi'
 
+ROOT_TAG = '/'
+ROOT_MAX_CHILDREN = 5 # see "pandoc display style math quirks" comment
+
+HEADING_MAXLVL = 6 # "HTML defines six levels of headings" per w3.org
+
 # The font size of documentclass in the tex file influents the height of
 # the output of dvisvgm but not proportionally (the two aren't even
 # positively correlated). However, svg files of different glyphs generated
-# with same documentclass font size are proportional.
-# Also need some padding since the bottom of letters get truncated without.
+# with the same documentclass font size are proportional.
+# Also need some padding since the bottom of letters would otherwise get
+# truncated.
 # 
 # Can experiment with:
 # $ latex -halt-on-error -interaction=nonstopmode tmp.tex >/dev/null
 # $ dvisvgm --cache=cache/ --no-fonts -s tmp.dvi
 
-SCALE = 1.35 # for \documentclass[12pt]
+SCALE = 0.1125 # em per viewBox unit for \documentclass[12pt]
 PAD = str(1)
 
 import argparse
@@ -158,72 +234,549 @@ class Monitor:
             return (0,0)
         return (stat.st_size, stat.st_mtime)
 
-# see "tag soup" example at the end of 3.12.1 docs for html.parser
-# note that getpos returns 1-based row and 0-based col just as in emacs
-# wish there was simply a getoffset ...
-class MathExtractor(HTMLParser):
-    def __init__(self, callback, haslg):
+# does not yet implement the full interface of list so is not a subclass
+class CircularList:
+    def __init__(self, arg):
+        if type(arg) is int:
+            if arg < 1:
+                raise ValueError('invalid size for CircularList()')
+            self._buff = [None] * arg
+            self._size = arg
+            self._used = 0
+        elif type(arg) is list:
+            self._buff = arg
+            self._size = len(arg)
+            self._used = self._size
+        else:
+            raise TypeError('wrong argument type for CircularList()')
+        self._head = 0
+
+    def append(self, elem):
+        if self._used < self._size:
+            self._used += 1
+        self._buff[self._head] = elem
+        self._head = (self._head + 1) % self._size
+
+    def pop(self):
+        if not self._used:
+            raise IndexError('pop from empty CircularList')
+        self._used -= 1
+        self._head = (self._head - 1) % self._size
+        return self._buff[self._head]
+
+    def __len__(self):
+        return self._used
+
+    def __getitem__(self, idx):
+        if idx >= 0 and idx < self._used:
+            return self._buff[(self._head - self._used + idx) % self._size]
+        elif idx < 0 and -idx <= self._used:
+            return self._buff[(self._head + idx) % self._size]
+        else:
+            raise IndexError('CircularList index out of range')
+
+    def __setitem__(self, idx, val):
+        if idx >= 0 and idx < self._used:
+            self._buff[(self._head - self._used + idx) % self._size] = val
+        elif idx < 0 and -idx <= self._used:
+            self._buff[(self._head + idx) % self._size] = val
+        else:
+            raise IndexError('CircularList index out of range')
+
+    def __iter__(self):
+        base = self._head - self._used
+        for i in range(self._used):
+            yield self._buff[(base + i) % self._size]
+
+    def __repr__(self):
+        return 'CircularList(%s)'%list(iter(self))
+
+    def __str__(self):
+        return self.__repr__()
+
+# see stackoverflow 3741896 for explanation of "solidus"
+class Node:
+    __slots__ = ('tag', '_attrs', 'solidus', '_parent', '_children', '_extra')
+    def __init__(self, tag, attrs, solidus, parent):
+        self.tag = tag
+        self._attrs = attrs
+        self.solidus = solidus
+        self._parent = parent
+        if tag == ROOT_TAG:
+            self._children = CircularList(ROOT_MAX_CHILDREN)
+        else:
+            self._children = []
+        self._extra = {}
+
+    @property
+    def parent(self):
+        return self._parent
+
+    @property
+    def attrs(self):
+        return self._attrs
+
+    def add_child(self, node):
+        self._children.append(node)
+
+    def pop_children(self, popcount):
+        while popcount:
+            try:
+                self._children.pop()
+            except IndexError:
+                break
+            popcount -= 1
+
+    def add_data(self, data):
+        self._children.append(data)
+
+    # The convention is this:
+    # for each node requiring special serialization
+    # save the serializer under 'ser' and its args under 'args'
+    # for each node requiring special attention
+    # save the relevant data under a key specific to the node type
+    def add_extra(self, dextra):
+        if type(dextra) is not dict:
+            raise NodeError('not a dict: %s'%dextra)
+        self._extra.update(dextra)
+
+    def set_extra(self, key, val):
+        self._extra[key] = val
+
+    def has_extra(self, key):
+        return key in self._extra
+
+    def get_extra(self, key):
+        return self._extra[key]
+
+    def del_extra(self, key):
+        del self._extra[key]
+
+    def has_children(self, mincount=1):
+        return len(self._children) >= mincount
+
+    def child_count(self):
+        return len(self._children)
+
+    def nthchild(self, n):
+        return self._children[n]
+
+    def get_attr(self, key):
+        for k, v in self._attrs:
+            if k == key:
+                return v
+        return None
+
+    def set_attr(self, key, val):
+        attrs = self._attrs
+        self._attrs = tuple((key, val) if k == key else (k, v)
+                            for k, v in attrs)
+
+    def serialize(self, sink):
+        if 'ser' in self._extra:
+            self._extra['ser'](sink, *self._extra['args'])
+            return
+        attrstr = ' '.join(map(lambda t: '%s="%s"'%t, self._attrs))
+        if self.solidus:
+            sink.send('<%s %s/>'%(self.tag, attrstr))
+        else:
+            sink.send('<%s %s>'%(self.tag, attrstr))
+            self.serinner(sink)
+            sink.send('</%s>'%self.tag)
+
+    def serinner(self, sink):
+        for c in self._children:
+            if isinstance(c, Node):
+                c.serialize(sink)
+            else:
+                sink.send(c)
+
+    def serinnerf1(self, sink, filtercb, args):
+        for c in self._children:
+            if isinstance(c, Node):
+                c.serialize(sink)
+            else:
+                sink.send(filtercb(c, *args))
+
+class NodeError(Exception):
+    pass
+
+# friend of Node
+class Tree:
+    Node = Node
+    def __init__(self, sink):
+        self._sink = sink
+        self._root = self.Node(ROOT_TAG, (), False, None)
+        self._cur = self._root
+        self._serial = 0
+
+    def start_child(self, tag, attrs):
+        self._maybe_root_care()
+        node = self.Node(tag, attrs, False, self._cur)
+        self._cur.add_child(node)
+        self._cur = node
+
+    def _maybe_root_care(self):
+        if self._cur is self._root:
+            self._serial += 1
+            if self._root.child_count() == ROOT_MAX_CHILDREN:
+                oldest = self._root._children[0]
+                if type(oldest) is self.Node:
+                    oldest.serialize(self._sink)
+                else:
+                    self._sink.send(oldest)
+
+    def startend_child(self, tag, attrs):
+        self._maybe_root_care()
+        node = self.Node(tag, attrs, True, self._cur)
+        self._cur.add_child(node)
+
+    def add_data(self, data):
+        self._maybe_root_care()
+        self._cur.add_data(data)
+
+    def end_child(self, tag):
+        if tag != self._cur.tag:
+            raise TreeError('Unexpect end tag "%s" '%tag +
+                            'not matching start tag "%s"'%self._cur.tag)
+        if self._cur is self._root:
+            raise TreeError('Unexpected end_child call at '+
+                            'serial=%d'%self._serial)
+        self._cur = self._cur._parent
+
+    def flush_root(self):
+        for c in self._root._children:
+            if type(c) is self.Node:
+                c.serialize(self._sink)
+            else:
+                self._sink.send(c)
+
+    @property
+    def cur(self):
+        return self._cur
+
+    def last_child(self):
+        return self._cur.nthchild(-1)
+
+    def get_serial(self):
+        return self._serial
+
+class TreeError(Exception):
+    pass
+
+############################################################
+# pandoc display style math quirks
+# 
+# With org input like:
+# <<target>>
+# $$ ... $$
+# 
+# pandoc generates (note the space, which triggers handle_data):
+# ...<span id="target"></span> <br /><img .../><br />...
+# 
+# With markdown input like:
+# []{#target}
+# $$ ... $$
+#
+# we get the same pandoc output, except if there are 2 or more trailing
+# spaces after []{#target}, pandoc generates (note the newline):
+# ...<span id="target"></span><br />
+# <br /><img ... /><br />...
+#
+# We want to keep just the img. The <br />s are unnecessary since
+# horizontal centering in SVG.wrap already has display:flex
+
+############################################################
+# pandoc org to html link conversion quirk
+# 
+# When pandoc converts org input to html output, a link like
+# [[/some/link][link text]]
+# becomes
+# <a href="file:///some/link">link text</a>
+#
+# This is undesireable (markdown input does not have this problem).
+# 
+# A tentative brute force solution is to strip all 'file://' prefixes
+# in links. If we really want to preserve the ability to write links
+# with file protocol, could maybe write as "docs://..." and convert back
+# to "file://...".
+
+class PandocHTMLNode(Node):
+    def pending_br_after_dm(self):
+        return (self.has_children(2) and
+                type(self.nthchild(-1)) is PandocHTMLNode and
+                self.nthchild(-1).has_extra('dm'))
+
+    def dm_label_search(self):
+        n = min(self.child_count(), ROOT_MAX_CHILDREN)
+        hist = ()
+        for i in range(2,n+1):
+            child = self.nthchild(-i)
+            if type(child) is not PandocHTMLNode:
+                continue
+            if child.tag == 'span':
+                if hist == ('br',) or hist == ('br', 'br'):
+                    return child, i
+            hist += (child.tag,)
+        # if no label, set popcount to 2 (just img and br)
+        return None, 2
+
+    def is_lg_pre(self):
+        return (self.parent.tag == ROOT_TAG and
+                self.has_children() and
+                self.nthchild(-1).tag == 'code')
+
+    def stripprotofile(self):
+        href = self.get_attr('href')
+        if href is not None and href.startswith('file://'):
+            self.set_attr('href', href[7:])
+
+    def wrap_heading(self, sink, hid, name):
+        sink.send(f'<{self.tag} id="{hid}" class="richly-heading">'+
+                  f'<a href="#{hid}">')
+        if name is not None:
+            sink.send(name + ' ')
+        self.serinner(sink)
+        sink.send(f'</a></{self.tag}>')
+
+class PandocHTMLTree(Tree):
+    Node = PandocHTMLNode
+
+class SubstituteWriter(HTMLParser):
+    def __init__(self, callback, idxeqns, numhdgs, haslg, noprotofile, sink):
         super().__init__()
         self.__callback = callback
+        self.__idxeqns = idxeqns
+        self.__numhdgs = numhdgs
         self.__haslg = haslg
-        self.__lgetpos = None
-        self.__lgtext = ''
-        self.__dataready = False
+        self.__noprotofile = noprotofile
+        self.__sink = sink
+        self.__tree = PandocHTMLTree(sink)
+        self.__eqnidx = 1
+        self.__all_rlsids = set()
+        self.__lid2xidname = {}
+        self.__hc = HeadingCruncher(numhdgs, self.__lid2xidname)
 
     def handle_startendtag(self, tag, attrs):
-        if tag != 'img':
-            return
-        dc = 0
-        title = ''
-        for k,v in attrs:
-            if k == 'src' and v.startswith('https://latex.codecogs.com'):
-                src = v
-                dc += 1
-            elif k == 'title':
-                formula = v
-                dc += 1
-            if dc == 2:
-                startpos = self.getpos()
-                endpos = self.getendpos(startpos, self.get_starttag_text())
-                if 'textstyle' in src:
-                    env = '$'
-                elif formula.startswith('\\begin'):
-                    env = ''
-                else:
-                    env = '$$'
-                self.__callback(startpos, endpos, formula, env)
+        if tag == 'img':
+            dc = 0
+            title = ''
+            for k,v in attrs:
+                if k == 'src' and v.startswith('https://latex.codecogs.com'):
+                    src = v
+                    dc += 1
+                elif k == 'title':
+                    formula = v
+                    dc += 1
+                if dc == 2:
+                    if 'textstyle' in src:
+                        env = '$'
+                    elif formula.lstrip().startswith('\\begin'):
+                        env = ''
+                    else:
+                        env = '$$'
+                    svg = self.__callback(formula, env)
+                    self.__all_rlsids.update(svg.rlsids)
+                    if env == '$':
+                        dextra = {'ser': svg.wrap,
+                                  'args': ()}
+                    elif self.__idxeqns:
+                        args = self.__nxt_eidname()
+                        dextra = {'ser': svg.wrap,
+                                  'args': args,
+                                  'dm': None}
+                    else:
+                        dextra = {'ser': svg.wrap,
+                                  'args': (),
+                                  'dm': None}
+                    self.__tree.startend_child(tag, attrs)
+                    self.__tree.last_child().add_extra(dextra)
+                    return
+            if dc > 0 and not title:
+                warn('webtex img without title:', self.get_starttag_text())
+        elif tag == 'br':
+            treecur = self.__tree.cur
+            if treecur.pending_br_after_dm():
+                img = treecur.nthchild(-1)
+                label, popcount = treecur.dm_label_search()
+                if label:
+                    lid = label.get_attr('id')
+                    if self.__idxeqns:
+                        args = img.get_extra('args')
+                        self.__lid2xidname[lid] = args
+                    else:
+                        img.set_extra('args', (lid, lid))
+                # see "pandoc display style math quirks" comment
+                treecur.pop_children(popcount)
+                treecur.add_child(img)
                 return
-        if dc > 0 and not title:
-            warn('webtex img without title:', self.get_starttag_text())
+        self.__tree.startend_child(tag, attrs)
 
-    @staticmethod
-    def getendpos(startpos, text):
-        r, c = startpos
-        lns = text.splitlines()
-        if len(lns) == 1:
-            return r, c + len(lns[0])
-        else:
-            return r + len(lns) - 1, len(lns[-1])
+    def __nxt_eidname(self):
+        name = str(self.__eqnidx)
+        eid = 'reid-%s'%name
+        self.__eqnidx += 1
+        return eid, name
 
-    def handle_starttag(self, tag, _):
-        if self.__haslg and tag == 'code':
-            self.__haslg = False
-            self.__dataready = True
+    def handle_starttag(self, tag, attrs):
+        self.__tree.start_child(tag, attrs)
+        if tag == 'a':
+            treecur = self.__tree.cur
+            if self.__idxeqns or self.__numhdgs:
+                treecur.add_extra({'ser': self.athunker(treecur),
+                                   'args': ()})
+            if self.__noprotofile:
+                treecur.stripprotofile()
+
+    def athunker(self, node):
+        # serialize as much as we can
+        def ser(sink):
+            href = node.get_attr('href')
+            if href and href.startswith('#'):
+                sink.send(AThunk(node, self.__lid2xidname))
+            else:
+                node.del_extra('ser')
+                node.serialize(sink)
+        return ser
 
     def handle_data(self, data):
-        if self.__dataready:
-            self.__lgtext = data
+        self.__tree.add_data(data)
 
     def handle_endtag(self, tag):
-        if self.__dataready:
-            self.__dataready = False
-            self.__lgetpos = self.getpos()
+        treecur = self.__tree.cur
+        if treecur.tag == 'pre':
+            if self.__haslg:
+                if self.__tree.get_serial() == 1:
+                    if treecur.is_lg_pre():
+                        self.__haslg = False
+                        ser = (lambda sink:
+                               treecur.nthchild(-1).serinner(sink))
+                        treecur.add_extra({'ser': ser, 'args': ()})
+                        self.__tree.end_child(tag)
+                        return
+                else:
+                    self.__haslg = False
+        elif self.__hc.probe(treecur.tag):
+            self.__hc.crunch(treecur)
+        self.__tree.end_child(tag)
 
-    def leading_garbage(self):
-        return self.__lgetpos, self.__lgtext
+    def __defonly_svg(self, id2pathd):
+        serd = '\n\n\n<svg style="display: none;"><defs>%s</defs></svg>' %\
+            '\n'.join(map(lambda x:\
+                          '<path id="%s" d="%s"></path>' %\
+                          (x, id2pathd[x]),
+                          self.__all_rlsids))
+        self.__sink.send(serd)
+        if DEBUG:
+            dbgprint(serd)
+
+    def conclude(self, id2pathd):
+        self.__tree.flush_root()
+        self.__defonly_svg(id2pathd)
+
+class HeadingCruncher:
+    def __init__(self, numhdgs, lid2xidname):
+        self._numhdgs = numhdgs
+        self._hdgidx = [0] * HEADING_MAXLVL
+        self._lvl = None
+        self._lid2xidname = lid2xidname
+
+    def probe(self, tag):
+        if len(tag) == 2 and tag[0] == 'h':
+            lvl = ord(tag[1]) - 49 # 49 == ord('1')
+            if lvl >= 0 and lvl <= 5:
+                self._lvl = lvl
+                return True
+        self._lvl = None
+        return False
+
+    def crunch(self, node):
+        if self._numhdgs:
+            lid = node.get_attr('id')
+            hid, name = self._nxt_hidname(lid)
+            node.set_attr('id', hid)
+            self._lid2xidname[lid] = (hid, name)
+        else:
+            hid = node.get_attr('id')
+            name = None
+        node.add_extra({'ser': node.wrap_heading,
+                        'args': (hid, name)})
+
+    def _nxt_hidname(self, lid):
+        self._incidx()
+        name = '.'.join(map(str, self._hdgidx[:self._lvl+1]))
+        hid = 'rhid-%s-%s'%(name, lid)
+        return hid, name
+
+    def _incidx(self):
+        self._hdgidx[self._lvl] += 1
+        for i in range(self._lvl+1, HEADING_MAXLVL):
+            self._hdgidx[i] = 0
+
+class AThunk:
+    __slots__ = '_node', '_lid2xidname'
+    def __init__(self, node, lid2xidname):
+        self._node = node
+        self._lid2xidname = lid2xidname
+
+    def serialize(self, sink):
+        node = self._node
+        name = None
+        sink.send('<a ')
+        for k, v in node.attrs:
+            if k == 'href' and v.startswith('#'):
+                sink.send('href="')
+                try:
+                    xid, name = self._lid2xidname[v[1:]]
+                except KeyError:
+                    sink.send(v)
+                else:
+                    sink.send('#%s'%xid)
+                sink.send('" ')
+            else:
+                sink.send('%s="%s" '%(k, v))
+        sink.send('>')
+        if name is None:
+            node.serinner(sink)
+        else:
+            node.serinnerf1(sink, resolve_dollars, (name,))
+        sink.send('</a>')
+
+def resolve_dollars(text, name):
+    r = ''
+    i = 0
+    n = len(text)
+    while i < n:
+        j = text.find('$', i)
+        if j == -1:
+            r += text[i:]
+            break
+        r += text[i:j]
+        i = j + 1
+        if i == n:
+            r += '$'
+            break
+        if text[i] == '_':
+            r += name
+            i += 1
+        elif text[i] == '$':
+            r += '$'
+            i += 1
+        else:
+            r += '$'
+    return r
+# >>> resolve_dollars('$$$_$_$_$', 'this')
+# '$thisthisthis$'
+# >>> resolve_dollars('$$$$$_$_$_$', 'this')
+# '$$thisthisthis$'
+# >>> resolve_dollars('$$$$$_$_$_$$$$', 'this')
+# '$$thisthisthis$$'
+# >>> resolve_dollars('_$$$$$_$_$_$$$$_', 'this')
+# '_$$thisthisthis$$_'
+
 
 class SVGParser(HTMLParser):
-    def __init__(self, callback, fontsize, lineheight, env):
+    def __init__(self, callback, lineheight, env):
         super().__init__()
         self.__callback = callback
         self.__lineheight = lineheight
@@ -239,7 +792,6 @@ class SVGParser(HTMLParser):
         self.__vbw = 0.0
         self.__vbh = 0.0
         self.__baseline = 0.0
-        self.__scale = SCALE * fontsize / 12
 
     def handle_starttag(self, tag, attrs):
         if tag == 'svg':
@@ -347,18 +899,18 @@ class SVGParser(HTMLParser):
         return '\n'.join(self.__rects)
 
     def attrdump(self):
-        astr = ' '.join(map(lambda t: '%s="%s"'%t, self.__attrs))
-        width = self.__vbw * self.__scale
-        height = self.__vbh * self.__scale
-        rest = 'width="%.2fpt" height="%.2fpt" ' % (width, height)
+        attrstr = ' '.join(map(lambda t: '%s="%s"'%t, self.__attrs))
+        width = self.__vbw * SCALE
+        height = self.__vbh * SCALE
+        rest = 'width="%.4fem" height="%.4fem" ' % (width, height)
         rest += 'viewbox="%.2f %.2f %.2f %.2f" ' % (self.__vbx, self.__vby,
                                                     self.__vbw, self.__vbh)
         if self.__inline:
             rest += self.__inline_style()
         if DEBUG:
             dbgprint(rest)
-        if astr:
-            return astr + ' ' + rest
+        if attrstr:
+            return attrstr + ' ' + rest
         else:  
             return rest
 
@@ -366,56 +918,102 @@ class SVGParser(HTMLParser):
         if DEBUG:
             dbgprint(f'vby: {self.__vby}, vbh: {self.__vbh}, '+
                      f'baseline: {self.__baseline}, '+
-                     f'lineheight: {self.__lineheight}, '+
-                     f'scale: {self.__scale}')
-        p = (self.__vby + self.__vbh - self.__baseline)\
-            * self.__scale / self.__lineheight
+                     f'lineheight: {self.__lineheight}')
+        p = (self.__vby + self.__vbh - self.__baseline) * SCALE\
+            / self.__lineheight
         return 'style="vertical-align:-%.2f%%"'%(p*100)
 
     def get_rlsids(self):
         return self.__pid2rlsid.values()
 
     def get_eitop(self):
-        return (self.__vbh * self.__scale - self.__lineheight) / 2
+        return (self.__vbh * SCALE - self.__lineheight) / 2
 
 class SVGParserError(Exception):
     pass
 
 class SVG:
-    __slots__ = 'code', 'env', 'rlsids', 'eitop'
+    __slots__ = 'formula', 'env', 'code', 'rlsids', 'eitop', 'isgood'
 
     def __init__(self, sp, formula, env):
+        self.formula = formula
+        self.env = env
         if sp:
             self.code = ('<svg class="richly-math" %s>'%sp.attrdump() +
                          '<title>%s</title>'%formula +
                          '<g>%s\n%s</g></svg>'%(sp.usedump(),
                                                 sp.rectdump()))
-            self.env = env
             self.rlsids = sp.get_rlsids()
             self.eitop = sp.get_eitop()
+            self.isgood = True
         else:
             self.code = ('<span style="color:red;border-style:solid;">'+
                          'LATEX ERROR: "%s"</span>'%formula)
-            self.env = env
             self.rlsids = {}.values() # just being type pedantic
             self.eitop = 0.0
+            self.isgood = False
+
+    # horizontal centering: stackoverflow 114543
+    def wrap(self, sink, eid=None, name=None):
+        if self.env == '$':
+            serd = self._wrapped_inline()
+        elif eid is None:
+            serd = self._wrapped_display_noidx()
+        else:
+            serd = self._wrapped_display_idx(eid, name)
+        sink.send(serd)
+
+    def _wrapped_inline(self):
+        return ('<span style="position:relative;">'+
+                self.code +
+                self._transparent_overlay() +
+                '</span>')
+
+    def _transparent_overlay(self):
+        if self.env == '$':
+            style = 'position:absolute;color:transparent;left:0;'
+        else:
+            style = 'position:absolute;color:transparent;'
+        return ('<span style="%s">'%style + 
+                self.env + self.formula + self.env +
+                '</span>')
+
+    def _wrapped_display_noidx(self):
+        style = 'justify-content:center;display:flex;position:relative;'
+        return ('<span style="%s">'%style +
+                self.code +
+                self._transparent_overlay() +
+                '</span>')
+
+    def _wrapped_display_idx(self, eid, name):
+        style = 'justify-content:center;display:flex;position:relative;'
+        return ('<span id="%s" style="%s">'%(eid, style) +
+                self.code+
+                self._transparent_overlay()+
+                self._idx(eid, name)+
+                '</span>')
+
+    def _idx(self, eid, name):
+        style = 'position:absolute;right:0;top:%.4fem;'%self.eitop
+        return ('<span style="%s">'%style+
+                '<a href="#%s">(%s)</a>'%(eid, name)+
+                '</span>')
 
 class MathRenderer:
-    def __init__(self, fontsize, lineheight, packages, haslg, verbose):
+    def __init__(self, lineheight, idxeqns, numhdgs, packages, haslg,
+                 noprotofile, verbose):
         self._cache = {}
         self._pathd2id = {}
         self._id2pathd = {}
         self._idn = 0
         self._args = None
-        self._data = None
-        self._all_rlsids = None
-        self._fontsize = fontsize
         self._lineheight = lineheight
+        self._idxeqns = idxeqns
+        self._numhdgs = numhdgs
         self._usepackages = ''.join((map(lambda p: '\\usepackage{%s}'%p,
                                          packages.split(':'))))
         self._haslg = haslg
-        self._lg = None
-        self._eqnidx = None
+        self._noprotofile = noprotofile
         self._verbose = verbose
         self._prep_dirs_devnull()
 
@@ -426,21 +1024,20 @@ class MathRenderer:
         except IOError as e:
             bail(e)
 
-    def subgen(self):
-        for t in self._data:
-            yield t
-
-    def feed(self, pdhtml):
-        self._eqnidx = 1
-        self._data = []
-        self._all_rlsids = set()
+    def render(self, pdhtml, sink):
         # a little peeking now saves a lot of checking later:
         haslg = self._haslg and pdhtml.startswith('<pre><code>')
-        me = MathExtractor(self._me_callback, haslg)
-        me.feed(pdhtml)
-        self._lg = me.leading_garbage()
+        sw = SubstituteWriter(self._sw_callback, self._idxeqns, self._numhdgs,
+                              haslg, self._noprotofile, sink)
+        next(sink)
+        sw.feed(pdhtml)
+        sw.conclude(self._id2pathd)
+        try:
+            sink.send(None)
+        except StopIteration:
+            pass
 
-    def _me_callback(self, startpos, endpos, formula, env):
+    def _sw_callback(self, formula, env):
         if self._verbose:
             info(f'formula: {formula}, env: {env}')
         try:
@@ -454,23 +1051,20 @@ class MathRenderer:
                             f.write(rawsvg)
                     except IOError:
                         pass
+            except IOError as e:
+                warn(e)
+                svg = SVG(None, formula, env)
             except CalledProcessError as e:
                 warn(pp_subproc_err(self._args, e))
                 svg = SVG(None, formula, env)
             else:
                 svg = self._restruct_svg(rawsvg, formula, env)
-                if svg.rlsids:
+                if svg.isgood:
                     self._cache[(formula, env)] = svg
-        if env == '$':
-            self._data.append((startpos, endpos, svg, None))
-        else:
-            self._data.append((startpos, endpos, svg, self._eqnidx))
-            self._eqnidx += 1
-        self._all_rlsids.update(svg.rlsids)
+        return svg
 
     def _render_svg(self, formula, env):
-        if not self._write_texfile(formula, env):
-            return self._err_place_holder
+        self._write_texfile(formula, env)
         self._args = ['latex', '-halt-on-error', '-interaction=nonstopmode',
                       '-output-directory='+TMPDIR, TEXFILE]
         run_proc(self._args, stdout=self._devnull, stderr=PIPE, check=True)
@@ -484,24 +1078,19 @@ class MathRenderer:
             blref = '{\_}'
         else:
             blref = ''
+        f = open(TEXFILE, 'w')
         try:
-            f = open(TEXFILE, 'w')
             f.write('\\documentclass[12pt]{article}' +
                     self._usepackages +
                     '\\pagestyle{empty}\\special{bgcolor Transparent}' +
                     '\\begin{document}' +
                     '%s%s%s%s'%(env, blref, formula, env) +
                     '\\end{document}')
-            return True
-        except IOError as e:
-            warn(e)
-            return False
         finally:
             f.close()
 
     def _restruct_svg(self, rawsvg, formula, env):
-        sp = SVGParser(self._sp_callback, self._fontsize, self._lineheight,
-                       env)
+        sp = SVGParser(self._sp_callback, self._lineheight, env)
         try:
             sp.feed(rawsvg)
             return SVG(sp, formula, env)
@@ -521,19 +1110,9 @@ class MathRenderer:
             self._id2pathd[rlsid] = pathd
             return rlsid
 
-    def leading_garbage(self):
-        return self._lg
-
-    def defonly_svg(self):
-        return '\n\n\n<svg style="display: none;"><defs>%s</defs></svg>' %\
-            '\n'.join(map(lambda x:\
-                          '<path id="%s" d="%s"></path>' %\
-                          (x, self._id2pathd[x]),
-                          self._all_rlsids))
-
 class Processor:
-    def __init__(self, stay, ext, haslg, fontsize, lineheight, idxeqns,
-                 packages, verbose, ifn, ofn):
+    def __init__(self, stay, ext, haslg, lineheight, idxeqns, numhdgs,
+                 packages, verbose, buffersize, ifn, ofn):
         self._stay = stay
         if ext:
             self._ext = ext
@@ -541,11 +1120,14 @@ class Processor:
             self._ext = os.path.splitext(ifn)[1][1:]
         if self._ext not in fmts:
             bail('unrecognized extension: %s'%self._ext)
-        self._mr = MathRenderer(fontsize, lineheight, packages, haslg,
-                                verbose)
+        # see "pandoc org to html link conversion quirk" comment
+        noprotofile = self._ext == 'org'
+        self._mr = MathRenderer(lineheight, idxeqns, numhdgs, packages, haslg,
+                                noprotofile, verbose)
         self._idxeqns = idxeqns
+        self._numhdgs = numhdgs
+        self._buffersize = buffersize
         self._ifmt = fmts[self._ext]
-        self._ofmt = fmts['md']
         self._ifn = abspath(ifn)
         if not isfile(self._ifn):
             bail('not a file: "%s"'%self._ifn)
@@ -556,6 +1138,8 @@ class Processor:
             bail('outfile is required with -s')
         else:
             self._ofn = ''
+        self._segs = []
+        self._segl = 0
 
     def run(self):
         self._onchange()
@@ -604,101 +1188,85 @@ class Processor:
             else:
                 bail(pp_subproc_err(args, e))
         pdhtml = done_proc.stdout.decode('utf-8')
-        self._mr.feed(pdhtml)
+        if self._idxeqns or self._numhdgs:
+            sink = self._arraysink_gen()
+        else:
+            sink = self._writesink_gen()
+        self._mr.render(pdhtml, sink)
+
+    def _arraysink_gen(self):
+        hi = 0
+        segs = self._segs
+        segl = self._segl
+        while True:
+            seg = yield
+            if seg is None:
+                break
+            if hi < segl:
+                segs[hi] = seg
+            else:
+                segs.append(seg)
+            hi += 1
+            pass
+        self._segl = len(segs)
+        sink = self._writesink_gen()
+        next(sink)
+        for i in range(hi):
+            if type(segs[i]) is AThunk:
+                segs[i].serialize(sink)
+            else:
+                sink.send(segs[i])
+        try:
+            sink.send(None)
+        except StopIteration:
+            pass
+
+    def _writesink_gen(self):
         if self._ofn:
             try:
-                ofh = open(self._ofn, 'w')
+                ofh = open(self._ofn, 'w', self._buffersize)
             except IOError as e:
                 bail('Failed to open "%s": %e'%(self._ofn, e))
         else:
             ofh = stdout
-        lgetpos, lgtext = self._mr.leading_garbage()
         try:
-            ofh.write(lgtext)
-            self._substitute_write(ofh, self._mr.subgen(), pdhtml, lgetpos)
-            ofh.write(self._mr.defonly_svg())
+            while True:
+                serd = yield
+                if serd is None:
+                    break
+                ofh.write(serd)
+                if DEBUG:
+                    dbgprint(serd)
+                    dbgprint('##############################')
+        except IOError as e:
+            bail(e)
         finally:
             if ofh is not stdout:
                 ofh.close()
 
-    # complicated logic required for r,c
-    def _substitute_write(self, ofh, subit, pdhtml, lgetpos):
-        lns = pdhtml.splitlines()
-        if lgetpos:
-            rcur, ccur = lgetpos
-            # sanity check:
-            if lns[rcur-1][ccur:].startswith('</code></pre>'):
-                ccur += 13
-            else:
-                # or simply fail?
-                warn('unexpected front matter end tags: %s'%\
-                     lns[rcur-1][ccur:])
-                rcur += 1
-                ccur = 0
-        else:
-            rcur, ccur = 1, 0
-        for startpos, endpos, svg, eqnidx in subit:
-            rlim, clim = startpos
-            if rcur < rlim:
-                ofh.write(lns[rcur-1][ccur:])
-                ofh.write('\n')
-                rcur += 1
-                while rcur < rlim:
-                    ofh.write(lns[rcur-1])
-                    ofh.write('\n')
-                    rcur += 1
-                ofh.write(lns[rcur-1][:clim])
-            else:
-                ofh.write(lns[rcur-1][ccur:clim])
-            ofh.write(self._wrap(svg, eqnidx))
-            rcur, ccur = endpos
-        ofh.write(lns[rcur-1][ccur:])
-        ofh.write('\n')
-        rcur += 1
-        while rcur <= len(lns):
-            ofh.write(lns[rcur-1])
-            ofh.write('\n')
-            rcur += 1
-
-    # horizontal centering: stackoverflow 114543
-    # also need css trick to remove extra spacing of <br/>s from pandoc :
-    # p > br { display: none; }
-    def _wrap(self, svg, eqnidx):
-        if svg.env == '$':
-            return svg.code
-        elif self._idxeqns:
-            return ('<span style="justify-content:center;'+
-                    'display:flex;'+
-                    'position: relative;">'+
-                    svg.code+
-                    '<span style="position:absolute;right:0;'+
-                    'top:%.2fpt;">(%d)'%(svg.eitop, eqnidx)+
-                    '</span></span>')
-        else:
-            return ('<span style="justify-content:center;display:flex;">' +
-                    svg.code +
-                    '</span>')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='richly') # ToDo
     parser.add_argument('-s', dest='stay', action='store_true',
-                        help='make the process run in server mode, '+
-                        'so that it stays until ctrl+c is pressed')
+                        help='run in server mode and do incremental '+
+                        'conversion until ctrl+c is pressed')
     parser.add_argument('-e', dest='ext', choices=fmts.keys(),
                         help='if supplied, overrides input file extension')
     parser.add_argument('-r', dest='haslg', action='store_true',
-                        help='input has front matter')
-    parser.add_argument('-f', dest='fontsize', type=int, default=12,
-                        help='font size in pt')
-    parser.add_argument('-l', dest='lineheight', type=int, default=18,
-                        help='line height in pt')
+                        help='preserve raw front matter as is')
+    parser.add_argument('-l', dest='lineheight', type=float, default=1.5,
+                        help='line height as a multiple of font size')
     parser.add_argument('-i', dest='idxeqns', action='store_true',
                         help='number latex display style formulas')
+    parser.add_argument('-n', dest='numhdgs', action='store_true',
+                        help='number headings')
     parser.add_argument('-p', dest='packages', type=str,
                         default='amssymb:amsmath',
                         help='colon seperated list of latex packages')
     parser.add_argument('-v', dest='verbose', action='store_true',
                         help='show the latex formula being processed')
+    parser.add_argument('-b', dest='buffersize', type=int, default=1048576,
+                        help='output buffer size in bytes')
     parser.add_argument('infile', metavar='infile', type=str,
                         help='the input file')
     parser.add_argument('outfile', metavar='outfile', nargs='?', default='',
@@ -717,10 +1285,11 @@ if __name__ == '__main__':
     Processor(args.stay,
               args.ext,
               args.haslg,
-              args.fontsize,
               args.lineheight,
               args.idxeqns,
+              args.numhdgs,
               args.packages,
               args.verbose,
+              args.buffersize,
               args.infile,
               args.outfile).run()

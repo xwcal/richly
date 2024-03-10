@@ -2,9 +2,10 @@ Intro
 =====
 
 **richly** converts markdown or emacs org-mode files into html and
-renders latex as inline svg. You can visit [this
-page](https://xwcal.github.io/posts/2024/01/21/on-exponentiation/) to
-see its product.
+renders latex as inline svg. You can visit
+[this page](https://xwcal.github.io/posts/2024/01/21/on-exponentiation/) or
+[this page](https://xwcal.github.io/posts/2024/02/29/jane-st-202303-robot-long-jump-solution/)
+to see its product.
 
 The initial iteration I wrote overnight a few years ago also included
 PlantUML integration (thus the name \"richly\"). The diagramming feature
