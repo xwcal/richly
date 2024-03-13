@@ -953,7 +953,6 @@ class SVG:
             self.eitop = 0.0
             self.isgood = False
 
-    # horizontal centering: stackoverflow 114543
     def wrap(self, sink, eid=None, name=None):
         if self.env == '$':
             serd = self._wrapped_inline()
@@ -963,33 +962,39 @@ class SVG:
             serd = self._wrapped_display_idx(eid, name)
         sink.send(serd)
 
-    def _wrapped_inline(self):
-        return ('<span style="position:relative;">'+
-                self.code +
-                self._transparent_overlay() +
-                '</span>')
+    def no_overlay(self):
+        return ''
 
-    def _transparent_overlay(self):
-        if self.env == '$':
-            style = 'position:absolute;color:transparent;left:0;'
-        else:
-            style = 'position:absolute;color:transparent;'
+    def transparent_overlay(self):
+        style = 'position:absolute;color:transparent;left:0;top:0;'
+        # prevent overlay from occupying more screen space than its parent:
+        style += ('overflow:hidden;text-overflow:clip;'+
+                 'max-width:100%;max-height:100%;')
         return ('<span style="%s">'%style + 
                 self.env + self.formula + self.env +
                 '</span>')
 
+    maybe_overlay = no_overlay
+
+    def _wrapped_inline(self):
+        return ('<span style="position:relative;">'+
+                self.code +
+                self.maybe_overlay() +
+                '</span>')
+
+    # horizontal centering: stackoverflow 114543
     def _wrapped_display_noidx(self):
         style = 'justify-content:center;display:flex;position:relative;'
         return ('<span style="%s">'%style +
                 self.code +
-                self._transparent_overlay() +
+                self.maybe_overlay() +
                 '</span>')
 
     def _wrapped_display_idx(self, eid, name):
         style = 'justify-content:center;display:flex;position:relative;'
         return ('<span id="%s" style="%s">'%(eid, style) +
                 self.code+
-                self._transparent_overlay()+
+                self.maybe_overlay()+
                 self._idx(eid, name)+
                 '</span>')
 
@@ -1260,6 +1265,8 @@ if __name__ == '__main__':
                         help='number latex display style formulas')
     parser.add_argument('-n', dest='numhdgs', action='store_true',
                         help='number headings')
+    parser.add_argument('-c', dest='overlay', action='store_true',
+                        help='add copyable overlay')
     parser.add_argument('-p', dest='packages', type=str,
                         default='amssymb:amsmath',
                         help='colon seperated list of latex packages')
@@ -1282,6 +1289,8 @@ if __name__ == '__main__':
                                               args.outfile))
     if args.stay and not args.outfile:
         bail('outfile is required when -s is specified')
+    if args.overlay:
+        SVG.maybe_overlay = SVG.transparent_overlay
     Processor(args.stay,
               args.ext,
               args.haslg,
