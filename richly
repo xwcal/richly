@@ -134,6 +134,7 @@ import argparse
 import os
 import filecmp
 import datetime
+import re
 
 abspath = os.path.abspath
 isfile = os.path.isfile
@@ -571,7 +572,7 @@ class SubstituteWriter(HTMLParser):
                 if dc == 2:
                     if 'textstyle' in src:
                         env = '$'
-                    elif formula.lstrip().startswith('\\begin'):
+                    elif has_math_mode(formula):
                         env = ''
                     else:
                         env = '$$'
@@ -673,6 +674,21 @@ class SubstituteWriter(HTMLParser):
     def conclude(self, id2pathd):
         self.__tree.flush_root()
         self.__defonly_svg(id2pathd)
+
+# Some latex environments already turns on math mode, like align*;
+# enclosing it in an extra pair of $$ results in:
+# "Erroneous nesting of equation structures;"
+# 
+# For align*, there is an alternative: aligned
+# (see github jgm pandoc issue 3059)
+# but a solution that doesn't require changing user habits is preferred:
+math_mode_env_enum = set(['align*', 'equation*'])
+def has_math_mode(formula):
+    m = re.match(r'\s*\\begin\{([^\}]+)\}', formula)
+    if m:
+        return m[1] in math_mode_env_enum
+    else:
+        return False
 
 class HeadingCruncher:
     def __init__(self, numhdgs, lid2xidname):
